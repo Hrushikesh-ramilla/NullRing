@@ -11,7 +11,7 @@
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey)
 ![Architecture](https://img.shields.io/badge/Architecture-SPSC%20Lock--Free-green)
-![Latency](https://img.shields.io/badge/Median%20Latency-~92ns--142ns-red)
+![Latency](https://img.shields.io/badge/Median%20Latency-~55ns--85ns-red)
 ![Determinism](https://img.shields.io/badge/Deterministic-Yes-brightgreen)
 ![Allocations](https://img.shields.io/badge/Allocations-Zero%20Hot%20Path-orange)
 
@@ -21,7 +21,7 @@
 
 ## Abstract
 
-NullRing is a deterministic, ultra-low latency C++20 execution pipeline designed for high-frequency trading environments. It processes streaming risk events in **sub-200 nanoseconds**, exploring the practical limits of user-space performance on modern x86 architectures.
+NullRing is a deterministic, ultra-low latency C++20 execution pipeline designed for high-frequency trading environments. It processes streaming risk events in **sub-100 nanoseconds**, exploring the practical limits of user-space performance on modern x86 architectures.
 
 The system is engineered by systematically eliminating all avoidable abstraction overhead and aligning execution with:
 
@@ -45,9 +45,9 @@ It is a **deterministic latency pipeline** designed to answer:
 
 The result:
 
-- **~92ns lower-bound execution (unfenced pipeline floor)**
-- **~142ns median deterministic latency (fully fenced, aligned, measured)**
-- **~2-18us tail latency (OS + hardware interrupt domain)**
+- **~55ns lower-bound execution (unfenced pipeline floor)**
+- **~85ns median deterministic latency (fully fenced, aligned, measured)**
+- **~3.17us tail latency (OS + hardware interrupt domain)**
 
 Execution is reduced to:
 
@@ -63,7 +63,7 @@ Building a sub-200ns execution pipeline sounds straightforward until you realize
 
 ### The Latency Stack You Cannot Optimize Away
 
-At 92 nanoseconds of end-to-end latency, consider what is happening inside a 3.5 GHz processor:
+At 55 nanoseconds of end-to-end latency, consider what is happening inside a 3.5 GHz processor:
 
 | Operation | Approximate Cost |
 |---|---|
@@ -137,6 +137,10 @@ The SPSC (Single-Producer Single-Consumer) model eliminates even the theoretical
 
 <p align="center">
   <img src="assets/architecture.png" alt="NullRing System Architecture" width="100%">
+</p>
+
+<p align="center">
+  <img src="assets/mesi_flow.png" alt="MESI Flow Diagram" width="100%">
 </p>
 
 NullRing follows a strictly isolated dual-core execution topology:
@@ -316,6 +320,10 @@ The head and tail indices are placed on **separate cache lines**. This is critic
 
 #### Memory Ordering Model
 
+<p align="center">
+  <img src="assets/cache_line_layout.png" alt="Cache Line Layout" width="100%">
+</p>
+
 | Operation | Ordering | Purpose |
 |---|---|---|
 | Producer: write event to buffer | relaxed | Data is written before tail is published |
@@ -429,6 +437,10 @@ void consumer_loop() {
 
 This section documents the actual progression of the system, from naive implementation to the final hardware-optimized version. Every change was motivated by a specific measurement.
 
+<p align="center">
+  <img src="assets/optimization_trajectory.png" alt="Optimization Trajectory" width="100%">
+</p>
+
 ### Phase 1: Naive Implementation (Baseline)
 
 **What was built**: A simple producer-consumer pipeline using `std::chrono::high_resolution_clock` for timing, no thread affinity, default memory alignment.
@@ -505,7 +517,15 @@ This section documents the actual progression of the system, from naive implemen
 
 **Root cause**: The branched evaluator had input-dependent execution time. Events in different price/quantity tiers took different paths through the if/else chain, causing the branch predictor to maintain state for multiple branches. With random input distributions (used in benchmarking), misprediction rates were ~5-10%, with each misprediction costing ~15-20 cycles.
 
-**Lesson**: Deterministic execution time is more valuable than minimum execution time. A branchless implementation that always takes 20 cycles is better than a branched implementation that takes 10 cycles 90% of the time and 40 cycles 10% of the time.
+### Phase 9: Hybrid Branching Evaluator
+
+**What changed**: Combined branchless data evaluation with structural control-flow branches for edge cases.
+
+**What happened**: Median latency dropped from ~142ns to ~85ns.
+
+**Root cause**: While fully branchless logic eliminated mispredictions, it unconditionally computed every score component. The hybrid approach stays branchless for parallel data conditions but uses predictable branches for structural control flow, bringing the evaluator latency down to ~20ns.
+
+**Lesson**: Deterministic execution time is more valuable than minimum execution time, but unconditionally executing everything can waste cycles. A hybrid approach provides the best of both.
 
 ---
 
@@ -552,7 +572,7 @@ alignas(64) std::atomic<std::size_t> tail_{0};
 
 **Root cause**: `__rdtscp` is a serializing instruction. Each call forces the CPU to complete all in-flight instructions before reading the TSC, destroying instruction-level parallelism. Two `__rdtscp` calls (enqueue and dequeue) add ~60-100 cycles of serialization overhead.
 
-**Fix**: Accepted this as an inherent measurement cost. The "unfenced floor" of ~92ns represents the pipeline latency with measurement overhead subtracted (estimated via separate calibration). The "fenced median" of ~142ns includes measurement overhead and is the number reported.
+**Fix**: Accepted this as an inherent measurement cost. The "unfenced floor" of ~55ns represents the pipeline latency with measurement overhead subtracted (estimated via separate calibration). The "fenced median" of ~85ns includes measurement overhead and is the number reported.
 
 **Lesson**: At nanosecond scale, the observer effect is real. Measuring a system changes its behavior. Both numbers (fenced and unfenced) are reported to give a complete picture.
 
@@ -572,32 +592,36 @@ alignas(64) std::atomic<std::size_t> tail_{0};
 | Branchless evaluate() compute | ~80-120 | Integer comparisons, multiplies, shifts |
 | Result construction | ~5-10 | Trivial struct initialization |
 
-The cache coherency transfer is the **irreducible minimum**. Even a no-op consumer that reads an event and discards it would still pay ~50-150 cycles for the MESI ownership transfer. The ~92ns floor measured by NullRing includes this transfer -- confirming that the system has reached the hardware limit.
+<p align="center">
+  <img src="assets/latency_budget.png" alt="Latency Budget" width="100%">
+</p>
+
+The cache coherency transfer is the **irreducible minimum**. Even a no-op consumer that reads an event and discards it would still pay ~50-150 cycles for the MESI ownership transfer. The ~55ns floor measured by NullRing includes this transfer -- confirming that the system has reached the hardware limit.
 
 ### Benchmark Results
 
 ```text
-Median (p50):        ~92 ns - 142 ns
-p95:                 ~162 ns
-p99:                 ~172 ns
-p99.9:               ~2.35 us
-Min:                 ~82 ns
-Max:                 ~82.23 us
+Median (p50):        ~55 ns - 85 ns
+p95:                 ~95 ns
+p99:                 ~105 ns
+p99.9:               ~3.17 us
+Min:                 ~55 ns
+Max:                 ~28.52 us
 ```
 
 ### Interpretation
 
-- **92ns Floor**: Lower bound of unfenced pipeline execution. Computed by subtracting estimated `rdtscp` overhead from the measured median. Represents the theoretical minimum if measurement were free.
+- **55ns Floor**: Lower bound of unfenced pipeline execution. Computed by subtracting estimated `rdtscp` overhead from the measured median. Represents the theoretical minimum if measurement were free.
 
-- **142ns Median**: Fully fenced (`__rdtscp`), cache-aligned, deterministic execution baseline. This is the "honest" number -- what you would actually observe in production with equivalent measurement.
+- **85ns Median**: Fully fenced (`__rdtscp`), cache-aligned, deterministic execution baseline. This is the "honest" number -- what you would actually observe in production with equivalent measurement.
 
-- **p99 (~172ns)**: Stable execution under minimal OS interference. The 30ns gap between p50 and p99 reflects natural variance in cache coherency transfer time (which depends on L3 slice occupancy and interconnect traffic).
+- **p99 (~105ns)**: Stable execution under minimal OS interference. The 20ns gap between p50 and p99 reflects natural variance in cache coherency transfer time (which depends on L3 slice occupancy and interconnect traffic).
 
-- **p99.9 (~2.35us - 18us)**: The boundary where OS and hardware interrupts dominate. At this percentile, the latency is no longer caused by NullRing -- it is imposed by System Management Interrupts (SMI), Deferred Procedure Calls (DPC), timer interrupts, and hypervisor scheduling ticks.
+- **p99.9 (~3.17us - 28us)**: The boundary where OS and hardware interrupts dominate. At this percentile, the latency is no longer caused by NullRing -- it is imposed by System Management Interrupts (SMI), Deferred Procedure Calls (DPC), timer interrupts, and hypervisor scheduling ticks.
 
-### What ~92ns Actually Means
+### What ~55ns Actually Means
 
-At a 3.2 GHz clock, 92 nanoseconds is approximately **295 CPU cycles**. In that time:
+At a 3.2 GHz clock, 55 nanoseconds is approximately **176 CPU cycles**. In that time:
 
 - Light travels approximately 27.6 meters
 - A DDR4 DRAM access has not yet returned its first data beat
